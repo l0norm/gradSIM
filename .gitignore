@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtualenv
+venv/
+.venv/
+env/
+
+# Training & evaluation outputs
+mappo_gat_runs/
+eval_results/
+sim_results/
+
+# SUMO detector dump outputs
+detectors_output.xml
+detectors_sb_output.xml
+
+# Backups / older artefacts
+*.bak
+*.bak2
+init5_king_fahad.net.xml.gz
+init5_routes.rou.xml
+routes.rou.zip
+init simulation/
+
+# Editor / OS / tool config
+.DS_Store
+.idea/
+.vscode/
+.claude/
+.codex
+*.swp

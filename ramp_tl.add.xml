@@ -1,0 +1,75 @@
+<additional>
+    <!--
+        Ramp metering TL programs for all 8 entry ramps.
+        programID = "ramp_meter"  (activated by TraCI after traci.start())
+
+        Phase indices map 1:1 to RL actions so setPhase(jid, action) works directly:
+          phase 0  →  action 0  =  restrict  (ramp RED)
+          phase 1  →  action 1  =  slow      (ramp AMBER)
+          phase 2  →  action 2  =  free      (ramp GREEN)
+
+        duration=999999 ensures phases never auto-advance between control steps.
+
+        State string length = number of controlled links at the junction.
+        - Most junctions: 4 links (0-2 = service-road through, 3 = ramp)  →  "GGGr"
+        - ramp_2 (4148807789): link 0 = ramp, 1-3 = highway through       →  "rGGG"
+        - ramp_8 (J1): 1 link only (pure ramp, no through traffic)        →  "r"
+    -->
+
+    <!-- ramp_1 — junction 464740420  (4 links, ramp = index 3) -->
+    <tlLogic id="464740420" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_2 — junction 4148807789  (4 links, ramp = index 0) -->
+    <tlLogic id="4148807789" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="rGGG"/>
+        <phase duration="999999" state="yGGG"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_3 — junction 4148805586  (4 links, ramp = index 3) -->
+    <tlLogic id="4148805586" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_4 — junction cluster_12071438980_470347781  (4 links, ramp = index 3) -->
+    <tlLogic id="cluster_12071438980_470347781" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_5 — junction 6353849522  (4 links, ramp = index 3) -->
+    <tlLogic id="6353849522" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_6 — junction 12043453290  (4 links, ramp = index 3) -->
+    <tlLogic id="12043453290" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_7 — junction 12043245545  (4 links, ramp = index 3) -->
+    <tlLogic id="12043245545" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="GGGr"/>
+        <phase duration="999999" state="GGGy"/>
+        <phase duration="999999" state="GGGG"/>
+    </tlLogic>
+
+    <!-- ramp_8 — junction J1  (1 link, ramp only — no through traffic) -->
+    <tlLogic id="J1" type="static" programID="ramp_meter" offset="0">
+        <phase duration="999999" state="r"/>
+        <phase duration="999999" state="y"/>
+        <phase duration="999999" state="G"/>
+    </tlLogic>
+
+</additional>

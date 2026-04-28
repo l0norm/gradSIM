@@ -1,0 +1,8 @@
+<viewsettings>
+    <delay value="80"/>
+    <!-- Default evaluation view:
+         centred on ramp_5 because it is near the middle of the corridor and the
+         ramp-meter signal is easy to watch while the policy is running. -->
+    <viewport zoom="950" x="2360" y="4030" angle="0.00"/>
+    <background backgroundColor="30 30 30" showGrid="0"/>
+</viewsettings>

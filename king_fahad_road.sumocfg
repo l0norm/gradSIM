@@ -1,0 +1,14 @@
+<configuration>
+
+    <input>
+        <net-file value="king_fahad.net.xml.gz"/>
+        <route-files value="routes.rou.xml"/>
+        <additional-files value="detectors.add.xml,ramp_tl.add.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="86400"/>
+    </time>
+
+</configuration>
