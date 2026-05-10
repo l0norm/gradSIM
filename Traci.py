@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 """
 Traci.py — MASAR: Multi-Agent Synchronizer for Adaptive Ramps
@@ -19,12 +21,13 @@ Architecture
                   obs[3] = previous stop/go action
                   obs[4] = mainline mean speed / free-flow speed
                   obs[5] = upstream main-lane occupancy (prev agent's downstream)
-  GAT         : Fully-connected N-agent directed graph (self-loops + cross-edges)
-                — provides cross-agent (neighbour) message passing on top of obs
+  GAT         : Doubly-linked-chain graph with self-loops (max in/out
+                degree = 3 per node — agent i ↔ agents i±1 + self).
+                GATEncoder stacks 3 GAT layers for multi-hop message passing.
   Actor       : Shared across agents (parameter sharing)
   Critic      : Centralized — sees all agents' enriched observations (CTDE)
-  Reward      : Cooperative blend  →  global flow term  −  global occ penalty
-                                    −  local queue (spill-back) penalty
+  Reward      : Cooperative scalar  →  − time_in_system / NORM_TIS
+                                       − β · ramp_queue / MAX_QUEUE_M
   Fallback    : ramps without E1 detectors use direct TraCI lane queries
 
 Outputs
@@ -69,7 +72,7 @@ import traci  # noqa: E402
 # ── Simulation / control ──────────────────────────────────────────────────────
 SUMO_CFG      = 'king_fahad_5ramp.sumocfg'
 STEP_LEN      = 1.0    # simulation step length (seconds)
-CTRL_INTERVAL = 20     # control decision every N sim-seconds
+CTRL_INTERVAL = 5      # control decision every N sim-seconds
 
 
 def read_sumocfg_end_time(sumocfg_path: Path, fallback: float = 7200.0) -> float:
@@ -94,16 +97,42 @@ N_AGENTS = 5
 OBS_DIM  = 6
 LEGACY_OBS_DIM = 4
 
-# Fully-connected directed graph with self-loops  (N×N edges)
-_n = N_AGENTS
-EDGE_SRC = np.array([i for i in range(_n) for _ in range(_n)], dtype=np.int32)
-EDGE_DST = np.array([j for _ in range(_n) for j in range(_n)], dtype=np.int32)
+# Doubly-linked-chain graph with self-loops: each node connects to itself plus
+# its immediate upstream and downstream neighbours (where they exist). This
+# matches the physical highway topology — ramp_i's traffic only directly
+# influences ramp_{i-1} and ramp_{i+1}. Max in-degree = max out-degree = 3.
+def _chain_edges(n: int) -> Tuple[np.ndarray, np.ndarray]:
+    src, dst = [], []
+    for i in range(n):
+        src.append(i); dst.append(i)              # self-loop
+        if i - 1 >= 0:
+            src.append(i - 1); dst.append(i)      # upstream → i
+            src.append(i);     dst.append(i - 1)  # i → upstream  (doubly linked)
+        if i + 1 < n:
+            src.append(i + 1); dst.append(i)      # downstream → i
+            src.append(i);     dst.append(i + 1)  # i → downstream
+    # de-duplicate (the cross-edges above add each undirected pair twice)
+    seen = set()
+    uniq_src, uniq_dst = [], []
+    for s, d in zip(src, dst):
+        if (s, d) not in seen:
+            seen.add((s, d))
+            uniq_src.append(s); uniq_dst.append(d)
+    return (np.array(uniq_src, dtype=np.int32),
+            np.array(uniq_dst, dtype=np.int32))
+
+EDGE_SRC, EDGE_DST = _chain_edges(N_AGENTS)
 
 # ── Action space ──────────────────────────────────────────────────────────────
-ACTION_DIM     = 2
-SPEED_TABLE    = {0: 22.22, 1: 22.22}            # keep ramp speed unchanged; control is by signal
-RATE_VPH_TABLE = {0: 0.0,   1: 900.0}            # coarse implied release rate for plots/logging
-ACTION_LABEL   = {0: 'Stop(red)', 1: 'Go(green)'}
+# Three discrete metering levels controlled by combining the ramp signal with
+# a per-lane max-speed limit. Action 0 = block (red); Action 1 = slow metering
+# (green + 18 km/h speed cap); Action 2 = free flow (green + 100 km/h).
+ACTION_DIM     = 3
+SPEED_TABLE    = {0: 0.5, 1: 5.0, 2: 27.78}      # m/s lane.setMaxSpeed value
+RATE_VPH_TABLE = {0: 0.0, 1: 360.0, 2: 900.0}    # implied release rate (vph)
+ACTION_LABEL   = {0: 'Block', 1: 'Slow(18km/h)', 2: 'Free(100km/h)'}
+# Map action → (signal_char, ramp_lane_max_speed_m_s)
+ACTION_TO_SIGNAL = {0: 'r', 1: 'g', 2: 'g'}
 
 # ── Agent / detector definitions (ordered north → south by junction y-coord) ──
 #
@@ -190,6 +219,9 @@ MAX_MAIN_FLOW   = 80.0    # max vehicles across 4 main lanes per CTRL_INTERVAL
 MAX_MAIN_OCC    = 100.0   # SUMO occupancy  0–100 %
 MAX_QUEUE_M     = 120.0   # queue length normalisation for E2 jam length
 TARGET_OCC      = 20.0    # reference downstream occupancy %  (cooperative reward target)
+# Time-in-system normaliser: an upper-bound estimate of mean vehicles in
+# the network during a control interval. Keeps the reward roughly in [-1, 0].
+MAX_TIS_VEHICLES = 1500.0
 
 # Safety constraint (Yang et al. ARM-style override).
 # If the ramp queue length passes this threshold, the agent's stop action is
@@ -201,6 +233,7 @@ SPILLBACK_QUEUE_M = 100.0
 # ── Neural-network hyper-parameters ──────────────────────────────────────────
 GAT_EMBED  = 16
 GAT_OUT    = 16
+GAT_LAYERS = 3                     # stacked GAT message-passing layers (2-4 ok)
 ENRICH_DIM = GAT_EMBED + GAT_OUT   # 32 per agent after GAT
 
 # ── PPO hyper-parameters ─────────────────────────────────────────────────────
@@ -213,12 +246,36 @@ LR           = 3e-4
 PPO_EPOCHS   = 4
 MINIBATCH    = 32
 
-# ── Episode config ────────────────────────────────────────────────────────────
-N_BASELINE_EPS = 3
-N_TRAIN_EPS    = 20
-N_EPISODES     = N_BASELINE_EPS + N_TRAIN_EPS   # 23 total
-BASELINE_TYPES = ['random', 'all_free', 'all_restrict']
-CKPT_EVERY     = 5   # save weights every N training episodes
+# ── Episode / training config ────────────────────────────────────────────────
+# Baselines: each policy runs ALONE across the whole day (one SUMO run per
+# baseline, all ramps under the same control method).
+BASELINE_TYPES = ['random', 'all_free', 'all_restrict', 'fixed_time', 'alinea']
+
+# MAPPO training is structured as:
+#     for day in range(N_EPOCHS):                # outer "day"/epoch loop
+#         for episode in range(N_EPISODES_PER_DAY):  # 1-2 hr windows in a day
+#             for it in range(N_ITERATIONS):    # PPO updates per episode
+#                 train_evaluate()
+# Each epoch is one full-day SUMO run; the day is sliced into rollout windows
+# (EPISODE_LEN_S long), and at every window boundary we fire N_ITERATIONS
+# of PPO updates over the experience collected during that window.
+# Quick-debug toggle: MASAR_DEBUG=1 (env var) clamps N_EPOCHS=1,
+# N_ITERATIONS=1, EPISODE_LEN_S=3600 so smoke runs finish quickly.
+# Baselines still run a full simulated day so comparisons stay meaningful.
+DEBUG_MODE = os.environ.get('MASAR_DEBUG', '0') not in ('', '0', 'false', 'False')
+
+if DEBUG_MODE:
+    N_EPOCHS         = 1
+    EPISODE_LEN_S    = 3600
+    N_ITERATIONS     = 1
+    CKPT_EVERY_EPOCH = 1
+else:
+    N_EPOCHS         = 3
+    EPISODE_LEN_S    = 3600       # 1-hour episodes (set to 7200 for 2-hour)
+    N_ITERATIONS     = 4          # PPO iterations per episode boundary
+    CKPT_EVERY_EPOCH = 1          # save a tagged checkpoint every N epochs
+
+N_EPISODES_PER_DAY = max(1, int(END_TIME // EPISODE_LEN_S))
 
 ALINEA_CSV  = Path('init simulation/alinea_log.csv')
 
@@ -228,9 +285,11 @@ IMG_DIR     = LOG_DIR / 'step_images'
 CSV_PATH    = LOG_DIR / 'mappo_gat_log.csv'
 EP_CSV_PATH = LOG_DIR / 'episode_summary.csv'
 WEIGHTS_DIR = LOG_DIR / 'weights'
+RESULTS_DIR = Path('results')   # per-method full-day CSVs (baselines + final eval)
 LOG_DIR.mkdir(exist_ok=True)
 IMG_DIR.mkdir(exist_ok=True)
 WEIGHTS_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
 
 _COLORS = [
     '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728',
@@ -242,7 +301,7 @@ _SIGNAL_OFF    = (50, 50, 50, 255)
 _SIGNAL_RED    = (220, 40, 40, 255)
 _SIGNAL_YELLOW = (255, 200, 0, 255)
 _SIGNAL_GREEN  = (40, 200, 70, 255)
-SIGNAL_STATE_BY_ACTION = {0: 'r', 1: 'g'}
+SIGNAL_STATE_BY_ACTION = ACTION_TO_SIGNAL  # back-compat alias
 
 YELLOW_DURATION = 3    # seconds a light stays yellow before going red
 UPDATE_INTERVAL = 1    # do a PPO weight update every N control steps (1 = every step)
@@ -378,9 +437,19 @@ def apply_signal_state(cfg: Dict, state_char: str):
     traci.trafficlight.setPhase(tl_id, phase_map.get(state_char, 0))
 
 
+def apply_ramp_speed_limit(cfg: Dict, action: int):
+    """Set the ramp lane's max speed to the value mapped from `action`.
+    Action 0 → very slow / blocked, Action 1 → 18 km/h, Action 2 → 100 km/h."""
+    try:
+        traci.lane.setMaxSpeed(cfg['ramp_lane'], float(SPEED_TABLE[int(action)]))
+    except traci.exceptions.TraCIException:
+        pass
+
+
 def apply_ramp_signal_action(cfg: Dict, action: int):
-    """Legacy wrapper: convert action int (0=stop, 1=go) to signal state char."""
-    apply_signal_state(cfg, SIGNAL_STATE_BY_ACTION[int(action)])
+    """Apply discrete metering action: signal state + ramp-lane speed limit."""
+    apply_signal_state(cfg, ACTION_TO_SIGNAL[int(action)])
+    apply_ramp_speed_limit(cfg, action)
 
 
 def process_yellow_transitions(runtime_cfg: List[Dict],
@@ -406,10 +475,17 @@ def transition_signal(runtime_cfg: List[Dict],
                       desired_action: int,
                       signal_chars: List[str],
                       yellow_timers: List[float]):
-    """Apply a desired stop/go action for agent i with proper yellow intermediate.
-    Green → Red must pass through yellow; all other transitions are immediate."""
-    desired_char = 'g' if desired_action == 1 else 'r'
+    """Apply a desired metering action for agent i.
+    Signal transitions: any green-state → red passes through yellow;
+    transitions between Slow (1) and Free (2) are speed-limit-only (signal
+    stays green); red → green is immediate. Speed limit always tracks the
+    desired action so 1 and 2 are distinguishable on the ramp lane."""
+    desired_char = ACTION_TO_SIGNAL[int(desired_action)]
     current = signal_chars[i]
+
+    # Always apply the lane speed limit for the desired action immediately.
+    # While in mid-yellow we still want the speed limit lowered toward 0.
+    apply_ramp_speed_limit(runtime_cfg[i], desired_action)
 
     if desired_char == 'r' and current == 'g':
         # Must go yellow first
@@ -421,7 +497,7 @@ def transition_signal(runtime_cfg: List[Dict],
         yellow_timers[i] = 0.0
         signal_chars[i] = 'g'
         apply_signal_state(runtime_cfg[i], 'g')
-    # same state or already mid-yellow → no change needed
+    # same state or already mid-yellow → only the speed-limit was changed
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -470,18 +546,27 @@ class GATLayer(keras.layers.Layer):
         return tf.nn.elu(agg)                                  # [N, out_dim]
 
 class GATEncoder(keras.Model):
-    """Embeds local obs then enriches via GAT message passing.
-    output = concat(embed, GAT(embed))  →  [N, ENRICH_DIM]"""
+    """Embeds local obs then enriches via stacked GAT message passing.
+    Multiple GAT layers (GAT_LAYERS) propagate information across the chain
+    so that distant ramps can influence each other through hop-by-hop
+    message passing on the doubly-linked graph.
+    output = concat(embed, GAT_stack(embed))  →  [N, ENRICH_DIM]"""
 
-    def __init__(self, obs_dim: int, embed_dim: int, gat_out: int):
+    def __init__(self, obs_dim: int, embed_dim: int, gat_out: int,
+                 num_layers: int = GAT_LAYERS):
         super().__init__(name='GATEncoder')
         self.embed = keras.layers.Dense(embed_dim, activation='relu', name='embed')
-        self.gat   = GATLayer(gat_out, name='gat')
+        # First GAT layer maps embed_dim → gat_out, subsequent ones gat_out → gat_out
+        self.gat_layers = [
+            GATLayer(gat_out, name=f'gat_{k}') for k in range(num_layers)
+        ]
 
     def call(self, obs: tf.Tensor) -> tf.Tensor:
-        h = self.embed(obs)           # [N, embed_dim]
-        g = self.gat(h)               # [N, gat_out]
-        return tf.concat([h, g], -1)  # [N, ENRICH_DIM]
+        h = self.embed(obs)              # [N, embed_dim]
+        g = h
+        for layer in self.gat_layers:
+            g = layer(g)                 # [N, gat_out]
+        return tf.concat([h, g], -1)     # [N, ENRICH_DIM]
 
 
 class SharedActor(keras.Model):
@@ -600,10 +685,17 @@ class MAPPOAgent:
             arrays['embed/vars/0'],
             arrays['embed/vars/1'],
         ])
-        self.encoder.gat.set_weights([
-            arrays['gat/vars/0'],
-            arrays['gat/vars/1'],
-        ])
+        for k, layer in enumerate(self.encoder.gat_layers):
+            # Newer checkpoints use gat_{k}; legacy single-layer checkpoints
+            # only had 'gat' — fall back to that for the first layer.
+            prefix = f'gat_{k}'
+            if f'{prefix}/vars/0' not in arrays and k == 0 and 'gat/vars/0' in arrays:
+                prefix = 'gat'
+            if f'{prefix}/vars/0' in arrays:
+                layer.set_weights([
+                    arrays[f'{prefix}/vars/0'],
+                    arrays[f'{prefix}/vars/1'],
+                ])
 
     def _manual_load_sequential(self, model: keras.Model, path: Path):
         arrays = self._read_h5_datasets(path)
@@ -700,16 +792,21 @@ class RolloutBuffer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer,
-               last_value: float = 0.0) -> float:
+               last_value: float = 0.0) -> Dict[str, float]:
+    """Run PPO_EPOCHS minibatch updates over the rollout buffer.
+    Returns the loss components from the most recent minibatch:
+        {'loss', 'actor_loss', 'critic_loss', 'entropy'}.
+    """
+    empty = {'loss': 0.0, 'actor_loss': 0.0, 'critic_loss': 0.0, 'entropy': 0.0}
     if len(buffer) == 0:
-        return 0.0
+        return empty
 
     adv_arr, ret_arr = buffer.compute_gae(last_value=last_value)
     obs_arr = np.array(buffer.obs,       dtype=np.float32)   # [T, N, D]
     act_arr = np.array(buffer.actions,   dtype=np.int32)     # [T, N]
     lp_arr  = np.array(buffer.log_probs, dtype=np.float32)   # [T, N]
     T       = obs_arr.shape[0]
-    last_loss = 0.0
+    last_components = dict(empty)
 
     for _ in range(PPO_EPOCHS):
         idx = np.random.permutation(T)
@@ -760,9 +857,14 @@ def ppo_update(agent: MAPPOAgent, buffer: RolloutBuffer,
             grads = tape.gradient(loss, agent.all_variables)
             grads, _ = tf.clip_by_global_norm(grads, 0.5)
             agent.optimizer.apply_gradients(zip(grads, agent.all_variables))
-            last_loss = float(loss)
+            last_components = {
+                'loss':        float(loss),
+                'actor_loss':  float(actor_loss),
+                'critic_loss': float(critic_loss),
+                'entropy':     float(entropy),
+            }
 
-    return last_loss
+    return last_components
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -814,15 +916,15 @@ def build_obs(ramp_release_accum: List[float],
 
 
 def apply_safety_override(actions: List[int], queue_accum: List[float]) -> List[int]:
-    """ARM-style safety constraint: replace 'stop' with 'go' when a ramp's queue
-    is approaching spill-back. Returns a new action list. The override is
-    purely operational — it does not alter the policy gradients."""
+    """ARM-style safety constraint: when a ramp's queue is approaching
+    spill-back, force the action to Free (ACTION_DIM-1) to drain it. The
+    override is purely operational — it does not alter policy gradients."""
     out = list(actions)
+    free_action = ACTION_DIM - 1
     for i, a in enumerate(actions):
-        if a == 0:
-            avg_q = queue_accum[i] / CTRL_INTERVAL
-            if avg_q >= SPILLBACK_QUEUE_M:
-                out[i] = 1
+        avg_q = queue_accum[i] / CTRL_INTERVAL
+        if avg_q >= SPILLBACK_QUEUE_M and a != free_action:
+            out[i] = free_action
     return out
 
 
@@ -909,37 +1011,34 @@ def get_runtime_agent_cfg(verbose: bool = True) -> List[Dict]:
     return cfgs
 
 
-def compute_reward(main_spd_accum: List[float],
-                   main_occ_accum: List[float],
-                   queue_accum:    List[float]) -> float:
+QUEUE_REWARD_WEIGHT = 0.5  # β: relative weight of ramp-queue penalty vs TIS
+
+def compute_reward(tis_accum:    float,
+                   queue_accum:  List[float]) -> float:
     """
-    MASAR cooperative reward (shared scalar — CTDE).
+    MASAR cooperative reward — minimises Time In System (TIS) and ramp queues.
 
-    Per the project spec (Solution §1.4.2), the reward blends:
-      • Global cost   — mainline delay  (highway-flow performance)
-                        + occupancy violation above TARGET_OCC
-      • Local cost    — ramp queue length  (spill-back / safety)
+    The two terms have minimal inductive bias:
+      • TIS = total vehicle-seconds spent in the network during the interval.
+        Reducing TIS is equivalent to maximising mainline throughput (since
+        Little's law links them via arrivals), so this single signal subsumes
+        the previous speed/occupancy proxies without baking in a TARGET_OCC.
+      • Ramp queue length — penalises spill-back / unfairness at the ramps.
 
-    Components (all clipped to roughly [0, 1]):
-        speed_r     = mean(main_spd) / FREE_FLOW_SPEED            (max=better)
-        occ_pen     = max(0, mean(occ) - TARGET_OCC) / MAX_MAIN_OCC
-        queue_pen   = mean(ramp_queue_m) / MAX_QUEUE_M
+    Both terms are normalised so the per-step reward stays roughly in
+    [-(1 + β), 0].  Higher (less negative) = better.
 
-    Combined reward (higher = better network state):
-        r  =  speed_r  −  0.5 · occ_pen  −  0.2 · queue_pen
-    The 0.2 weight on queue_pen is stronger than a baseline speed-only reward,
-    addressing the local-fairness gap noted in Deng et al.'s MAPPO design.
+        tis_pen   = mean_vehicles_in_network / MAX_TIS_VEHICLES
+        queue_pen = mean(ramp_queue_m) / MAX_QUEUE_M
+        r         = -tis_pen  -  β · queue_pen
     """
-    n          = CTRL_INTERVAL
-    avg_spd    = float(np.mean(main_spd_accum)) / n
-    avg_occ    = float(np.mean(main_occ_accum)) / n
-    avg_queue  = float(np.mean(queue_accum))     / n
+    mean_vehicles = float(tis_accum) / max(CTRL_INTERVAL, 1)
+    avg_queue     = float(np.mean(queue_accum)) / max(CTRL_INTERVAL, 1)
 
-    speed_r    = avg_spd / FREE_FLOW_SPEED
-    occ_pen    = max(0.0, avg_occ - TARGET_OCC) / MAX_MAIN_OCC
-    queue_pen  = avg_queue / MAX_QUEUE_M
+    tis_pen   = mean_vehicles / MAX_TIS_VEHICLES
+    queue_pen = avg_queue     / MAX_QUEUE_M
 
-    return float(speed_r - 0.5 * occ_pen - 0.2 * queue_pen)
+    return float(-tis_pen - QUEUE_REWARD_WEIGHT * queue_pen)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -950,13 +1049,81 @@ def fixed_policy(policy_type: str) -> Tuple[List[int], List[float]]:
     if policy_type == 'random':
         acts = [random.randint(0, ACTION_DIM - 1) for _ in range(N_AGENTS)]
     elif policy_type == 'all_free':
-        acts = [ACTION_DIM - 1] * N_AGENTS
+        acts = [ACTION_DIM - 1] * N_AGENTS              # action 2 = free flow
     elif policy_type == 'all_restrict':
-        acts = [0] * N_AGENTS
+        acts = [0] * N_AGENTS                           # action 0 = block
     else:
-        acts = [1] * N_AGENTS
+        acts = [ACTION_DIM - 1] * N_AGENTS
     lp = [math.log(1.0 / ACTION_DIM)] * N_AGENTS
     return acts, lp
+
+
+# ── Stronger (realistic) baselines ───────────────────────────────────────────
+# These are stateful controllers that need memory across control steps, so
+# they're invoked through `step()` once per ctrl decision rather than via the
+# stateless `fixed_policy` helper.
+
+class FixedTimePolicy:
+    """Cycles every ramp through a fixed Free → Block duty cycle.
+    Default 30 s green / 10 s red simulates a deterministic timer."""
+
+    def __init__(self, green_s: float = 30.0, red_s: float = 10.0):
+        self.green_s = float(green_s)
+        self.red_s   = float(red_s)
+        self.period  = self.green_s + self.red_s
+
+    def step(self, sim_time: float, *_args, **_kw
+             ) -> Tuple[List[int], List[float]]:
+        phase = sim_time % self.period
+        free  = ACTION_DIM - 1
+        block = 0
+        a     = free if phase < self.green_s else block
+        acts  = [a] * N_AGENTS
+        lp    = [math.log(1.0 / ACTION_DIM)] * N_AGENTS
+        return acts, lp
+
+
+class ALINEAPolicy:
+    """Per-ramp ALINEA occupancy-feedback metering, mapped to the 3-action
+    discrete space.  r(k+1) = r(k) + K_R · (o_target − o_meas), clipped to
+    [r_min, r_max]; the resulting rate is bucketed into Block/Slow/Free."""
+
+    def __init__(self, kr: float = 70.0, o_target: float = 18.0,
+                 r_min: float = 0.0, r_max: float = 900.0):
+        self.kr       = float(kr)
+        self.o_target = float(o_target)
+        self.r_min    = float(r_min)
+        self.r_max    = float(r_max)
+        self.rates    = [self.r_max] * N_AGENTS
+
+    def step(self, _sim_time: float,
+             main_occ_accum: List[float],
+             *_args, **_kw) -> Tuple[List[int], List[float]]:
+        acts: List[int] = []
+        for i in range(N_AGENTS):
+            o_meas       = main_occ_accum[i] / max(CTRL_INTERVAL, 1)
+            self.rates[i] = float(np.clip(
+                self.rates[i] + self.kr * (self.o_target - o_meas),
+                self.r_min, self.r_max))
+            r = self.rates[i]
+            if r < 100.0:
+                acts.append(0)              # Block
+            elif r < 600.0:
+                acts.append(1)              # Slow metering
+            else:
+                acts.append(ACTION_DIM - 1)  # Free flow
+        lp = [math.log(1.0 / ACTION_DIM)] * N_AGENTS
+        return acts, lp
+
+
+def make_baseline_controller(ep_type: str):
+    """Returns a stateful controller instance for stronger baselines, or
+    None for stateless ones (random / all_free / all_restrict)."""
+    if ep_type == 'fixed_time':
+        return FixedTimePolicy()
+    if ep_type == 'alinea':
+        return ALINEAPolicy()
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -999,8 +1166,8 @@ def save_step_image(episode:      int,
         acts = [ah[ai] for ah in actions_hist]
         ax.step(steps[:len(acts)], acts, color=_COLORS[ai % len(_COLORS)],
                 label=AGENT_CFG[ai]['name'], linewidth=1.0, where='post')
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(['Stop', 'Go'], fontsize=7)
+    ax.set_yticks(list(range(ACTION_DIM)))
+    ax.set_yticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)], fontsize=7)
     ax.set_title('Action per Agent')
     ax.legend(fontsize=6, ncol=2); ax.grid(True, alpha=0.3)
 
@@ -1034,7 +1201,7 @@ def save_step_image(episode:      int,
                label=AGENT_CFG[ai]['name'],
                color=_COLORS[ai % len(_COLORS)], alpha=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(['Stop', 'Go'], fontsize=7)
+    ax.set_xticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)], fontsize=7)
     ax.set_title('Action Distribution')
     ax.legend(fontsize=6, ncol=2); ax.grid(True, axis='y', alpha=0.3)
 
@@ -1049,58 +1216,83 @@ def save_step_image(episode:      int,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_comparison_plot(summaries: List[Dict]):
+    """Six-panel summary across all policies (incl. MAPPO and mappo_eval).
+    Panels: cum reward · learning curve · mean TIS · mean queue · throughput
+    · mean waiting time. Bar plots aggregate by ep_type."""
     TYPE_COLOR = {
         'random':       '#9E9E9E',
         'all_free':     '#4CAF50',
         'all_restrict': '#F44336',
+        'fixed_time':   '#FF9800',
+        'alinea':       '#9C27B0',
         'mappo':        '#2196F3',
+        'mappo_eval':   '#0D47A1',
     }
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('MAPPO+GAT vs Baselines — Training Summary (Objective: Max Mean Speed)',
-                 fontsize=12, fontweight='bold')
+    color_for = lambda t: TYPE_COLOR.get(t, '#2196F3')
 
-    episodes    = [s['episode']    for s in summaries]
-    cum_rewards = [s['cum_reward'] for s in summaries]
-    ep_types    = [s['ep_type']    for s in summaries]
-    colors      = [TYPE_COLOR.get(t, '#2196F3') for t in ep_types]
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('MAPPO+GAT vs Baselines — Training & Evaluation Summary',
+                 fontsize=13, fontweight='bold')
 
-    axes[0].bar(episodes, cum_rewards, color=colors)
-    axes[0].set_title('Cumulative Reward per Episode')
-    axes[0].set_xlabel('Episode'); axes[0].set_ylabel('Cumulative Reward (norm. speed)')
-    axes[0].grid(True, axis='y', alpha=0.3)
+    episodes = [s['episode']     for s in summaries]
+    rewards  = [s['cum_reward']  for s in summaries]
+    ep_types = [s['ep_type']     for s in summaries]
+    bar_cols = [color_for(t)     for t in ep_types]
+
+    # (0,0) cumulative reward bar by episode
+    axes[0, 0].bar(episodes, rewards, color=bar_cols)
+    axes[0, 0].set_title('Cumulative Reward per Episode')
+    axes[0, 0].set_xlabel('Episode'); axes[0, 0].set_ylabel('Cum reward')
+    axes[0, 0].grid(True, axis='y', alpha=0.3)
     patches = [plt.Rectangle((0, 0), 1, 1, color=c, label=k)
-               for k, c in TYPE_COLOR.items()]
-    axes[0].legend(handles=patches, fontsize=8)
+               for k, c in TYPE_COLOR.items() if k in set(ep_types)]
+    axes[0, 0].legend(handles=patches, fontsize=7, ncol=2)
 
-    mappo_eps = [s['episode']    for s in summaries if s['ep_type'] == 'mappo']
-    mappo_avg = [s['avg_reward'] for s in summaries if s['ep_type'] == 'mappo']
-    axes[1].plot(mappo_eps, mappo_avg, color='#2196F3', linewidth=2,
-                 marker='o', label='MAPPO')
-    for btype in BASELINE_TYPES:
-        vals = [s['avg_reward'] for s in summaries if s['ep_type'] == btype]
+    # (0,1) MAPPO learning curve overlaid on baselines
+    mappo_eps  = [s['episode']     for s in summaries if s['ep_type'] == 'mappo']
+    mappo_avg  = [s['mean_reward'] for s in summaries if s['ep_type'] == 'mappo']
+    if mappo_eps:
+        axes[0, 1].plot(mappo_eps, mappo_avg, color=TYPE_COLOR['mappo'],
+                        linewidth=2, marker='o', label='MAPPO (train)')
+    for btype in BASELINE_TYPES + ['mappo_eval']:
+        vals = [s['mean_reward'] for s in summaries if s['ep_type'] == btype]
         if vals:
-            bline = np.mean(vals)
-            axes[1].axhline(bline, linestyle='--', color=TYPE_COLOR[btype],
-                            linewidth=1.3,
-                            label=f'{btype} (avg={bline:.4f})')
-    axes[1].set_title('MAPPO Learning Curve vs Baselines')
-    axes[1].set_xlabel('Episode'); axes[1].set_ylabel('Avg Step Reward')
-    axes[1].legend(fontsize=8); axes[1].grid(True, alpha=0.3)
+            axes[0, 1].axhline(float(np.mean(vals)), linestyle='--',
+                               color=color_for(btype), linewidth=1.2,
+                               label=f'{btype} ({np.mean(vals):.3f})')
+    axes[0, 1].set_title('Mean Reward — MAPPO vs Baselines')
+    axes[0, 1].set_xlabel('Episode'); axes[0, 1].set_ylabel('Mean step reward')
+    axes[0, 1].legend(fontsize=7); axes[0, 1].grid(True, alpha=0.3)
 
-    type_labels, type_means, type_cols = [], [], []
-    for btype in BASELINE_TYPES + ['mappo']:
-        vals = [s['avg_reward'] for s in summaries if s['ep_type'] == btype]
-        if vals:
-            type_labels.append(btype)
-            type_means.append(np.mean(vals))
-            type_cols.append(TYPE_COLOR[btype])
-    axes[2].bar(type_labels, type_means, color=type_cols)
-    axes[2].set_title('Mean Avg Reward by Policy')
-    axes[2].set_xlabel('Policy'); axes[2].set_ylabel('Mean Avg Step Reward')
-    axes[2].grid(True, axis='y', alpha=0.3)
-    for xi, (lbl, val) in enumerate(zip(type_labels, type_means)):
-        offset = abs(val) * 0.03 + 0.001
-        axes[2].text(xi, val + offset, f'{val:.4f}', ha='center', fontsize=8)
+    # Helper: aggregate `field` by ep_type (mean across episodes for that type)
+    def _by_type(field: str):
+        out_labels, out_means, out_cols = [], [], []
+        for t in BASELINE_TYPES + ['mappo', 'mappo_eval']:
+            vals = [float(s.get(field, 0.0))
+                    for s in summaries if s['ep_type'] == t]
+            if vals:
+                out_labels.append(t)
+                out_means.append(float(np.mean(vals)))
+                out_cols.append(color_for(t))
+        return out_labels, out_means, out_cols
+
+    panel_specs = [
+        ((0, 2), 'mean_tis',          'Mean Time-In-System (vehicles)'),
+        ((1, 0), 'mean_queue',        'Mean Ramp Queue (m)'),
+        ((1, 1), 'throughput',        'Throughput (vehicles served)'),
+        ((1, 2), 'mean_waiting_time', 'Mean Waiting Time (s/veh)'),
+    ]
+    for (r, c), field, title in panel_specs:
+        labels, means, cols = _by_type(field)
+        axes[r, c].bar(labels, means, color=cols)
+        axes[r, c].set_title(title)
+        axes[r, c].set_ylabel(field)
+        axes[r, c].grid(True, axis='y', alpha=0.3)
+        axes[r, c].tick_params(axis='x', rotation=20)
+        for xi, val in enumerate(means):
+            offset = abs(val) * 0.03 + (0.5 if abs(val) > 100 else 0.01)
+            axes[r, c].text(xi, val + offset, f'{val:.2g}',
+                            ha='center', fontsize=7)
 
     path = LOG_DIR / 'comparison_summary.png'
     fig.tight_layout()
@@ -1118,8 +1310,16 @@ def run_episode(episode:      int,
                 agent:        MAPPOAgent,
                 buffer:       RolloutBuffer,
                 csv_writer,
-                ep_csv_writer) -> Dict:
-    """Run one full episode. Returns summary dict."""
+                ep_csv_writer,
+                epoch:        int = 1,
+                eval_mode:    bool = False,
+                method_csv_writer = None) -> Dict:
+    """Run one full-day episode.
+    For ep_type=='mappo' (and not eval_mode), the day is internally
+    sub-divided into EPISODE_LEN_S windows; PPO updates fire N_ITERATIONS
+    times at each window boundary. Baselines and eval_mode runs do no PPO.
+    `method_csv_writer`, if provided, receives the same per-step rows as
+    `csv_writer` and is used for results/{method}_day.csv outputs."""
     traci.start([
         'sumo', '-c', SUMO_CFG,
         '--step-length', str(STEP_LEN),
@@ -1145,7 +1345,12 @@ def run_episode(episode:      int,
     main_flow_accum = [0.0] * N_AGENTS
     main_occ_accum  = [0.0] * N_AGENTS
     main_spd_accum  = [0.0] * N_AGENTS
+    tis_accum       = 0.0   # Σ vehicles_in_network over current CTRL_INTERVAL window
+    tis_episode_sum = 0.0   # Σ tis_accum across windows (for mean_tis KPI)
+    waiting_sum     = 0.0   # Σ accumulated waiting time (vehicle-seconds)
     sim_steps_accum = 0
+    baseline_ctrl   = make_baseline_controller(ep_type)
+    is_mappo_train  = (ep_type == 'mappo' and not eval_mode)
 
     # Traffic-light state tracking for yellow transition
     signal_chars  = ['g'] * N_AGENTS   # actual current signal per ramp
@@ -1166,11 +1371,22 @@ def run_episode(episode:      int,
 
     cum_reward  = 0.0
     ctrl_step   = 0
+    last_loss_components = {'loss': 0.0, 'actor_loss': 0.0,
+                            'critic_loss': 0.0, 'entropy': 0.0}
     ppo_loss    = 0.0
     steps_since_update = 0
+    sub_episode = 0   # rollout-window index within the current day (MAPPO only)
+    sim_start   = traci.simulation.getTime()
 
     print(f"\n{'='*70}")
-    print(f"  Episode {episode:3d}  [{ep_type}]")
+    if is_mappo_train:
+        print(f"  Epoch {epoch}  Episode {episode:3d}  [{ep_type}]  "
+              f"(day split into {N_EPISODES_PER_DAY} × {EPISODE_LEN_S}s windows, "
+              f"{N_ITERATIONS} PPO iters/window)")
+    elif ep_type == 'mappo' and eval_mode:
+        print(f"  Episode {episode:3d}  [mappo-eval]  (no learning — full day)")
+    else:
+        print(f"  Episode {episode:3d}  [{ep_type}]  (baseline — full day)")
     print(f"{'='*70}")
     print(f"  {'t(s)':>6}  {'signals':>12}  {'spd(km/h)':>18}  {'rwd':>8}  {'cum':>10}  {'loss':>10}")
     print(f"  {'-'*75}")
@@ -1190,9 +1406,20 @@ def run_episode(episode:      int,
             # Advance yellow countdowns before accumulating measurements
             process_yellow_transitions(runtime_cfg, signal_chars, yellow_timers)
 
-            # KPI: Total Travel Time = Σ (vehicles in network × dt)
+            # KPI + reward signal: Total Travel Time = Σ (vehicles in network × dt)
+            # waiting_sum (vehicle-seconds of halt) is a SUMO-style delay proxy
+            # — sum of halted vehicles per sim step × dt, accumulated across
+            # all main + ramp lanes touched by the controlled ramps.
             try:
-                ttt_seconds += traci.vehicle.getIDCount() * STEP_LEN
+                vehs_now     = traci.vehicle.getIDCount()
+                ttt_seconds += vehs_now * STEP_LEN
+                tis_accum   += float(vehs_now)
+                halt_now = 0
+                for cfg in runtime_cfg:
+                    halt_now += traci.lane.getLastStepHaltingNumber(cfg['ramp_lane'])
+                    for lane in cfg['main_lanes']:
+                        halt_now += traci.lane.getLastStepHaltingNumber(lane)
+                waiting_sum += halt_now * STEP_LEN
             except traci.exceptions.TraCIException:
                 pass
 
@@ -1215,7 +1442,13 @@ def run_episode(episode:      int,
                             obs_dim=agent.obs_dim)
 
             if ep_type == 'mappo':
-                actions, log_probs, value = agent.act(obs)
+                if eval_mode:
+                    actions, log_probs, value, _ = agent.greedy_act(obs)
+                else:
+                    actions, log_probs, value = agent.act(obs)
+            elif baseline_ctrl is not None:
+                actions, log_probs = baseline_ctrl.step(sim_time, main_occ_accum)
+                value = agent.get_value(obs)
             else:
                 actions, log_probs = fixed_policy(ep_type)
                 value = agent.get_value(obs)
@@ -1234,9 +1467,10 @@ def run_episode(episode:      int,
                     print(f"  [TL warning] {cfg['name']} action={actions[i]}: {exc}")
                 passed_totals[i] += int(ramp_flow_accum[i])
 
-            reward     = compute_reward(main_spd_accum, main_occ_accum, queue_accum)
+            reward     = compute_reward(tis_accum, queue_accum)
             cum_reward += reward
             done       = (sim_time >= END_TIME - CTRL_INTERVAL)
+            tis_episode_sum += tis_accum  # accumulate window-mean for KPI
 
             # Convert accumulators to per-step averages for logging / plotting
             avg_spd_per_agent   = [main_spd_accum[i] / CTRL_INTERVAL
@@ -1265,9 +1499,10 @@ def run_episode(episode:      int,
                 f"{reward:>+8.4f}  {cum_reward:>10.2f}  {ppo_loss:>10.6f}"
             )
 
-            # Per-step CSV (one row per agent)
+            # Per-step CSV (one row per agent) — written to both the global
+            # log and the optional per-method results file.
             for i, cfg in enumerate(runtime_cfg):
-                csv_writer.writerow({
+                row = {
                     'episode':          episode,
                     'ep_type':          ep_type,
                     'sim_time':         f'{sim_time:.1f}',
@@ -1283,33 +1518,51 @@ def run_episode(episode:      int,
                     'cum_reward':       f'{cum_reward:.4f}',
                     'value':            f'{value:.4f}',
                     'passed_total':     passed_totals[i],
-                })
+                }
+                csv_writer.writerow(row)
+                if method_csv_writer is not None:
+                    method_csv_writer.writerow(row)
 
             # Per-step diagnostic image
             save_step_image(episode, ctrl_step, sim_time, ep_type,
                             rewards_hist, cum_hist,
                             actions_hist, flows_hist, speed_hist, occ_hist)
 
-            if ep_type == 'mappo':
+            if is_mappo_train:
                 buffer.add(obs, actions, log_probs, reward, value, done)
                 steps_since_update += 1
 
-                # Online PPO update every UPDATE_INTERVAL steps. The fresh
-                # weights are flushed to WEIGHTS_DIR immediately so that any
-                # concurrent evaluate.py / simulate.py picks up the latest
-                # policy without waiting for the episode (or training) to end.
-                if steps_since_update >= UPDATE_INTERVAL and len(buffer) >= 1:
-                    last_val = agent.get_value(np.array(buffer.obs[-1], dtype=np.float32))
-                    ppo_loss = ppo_update(agent, buffer, last_val)
+                # Episode-boundary PPO trigger: every EPISODE_LEN_S of sim time
+                # we close the current rollout window and run N_ITERATIONS of
+                # PPO updates over it. This implements the inner two loops of
+                #   for episode in range(N_EPISODES_PER_DAY):
+                #       for it in range(N_ITERATIONS): train_evaluate()
+                # within a single day-long SUMO run.
+                episode_boundary = (sim_time >= (sub_episode + 1) * EPISODE_LEN_S
+                                    or done)
+                if episode_boundary and len(buffer) >= 1:
+                    last_val = agent.get_value(
+                        np.array(buffer.obs[-1], dtype=np.float32))
+                    for _it in range(N_ITERATIONS):
+                        last_loss_components = ppo_update(agent, buffer, last_val)
+                    ppo_loss = last_loss_components['loss']
                     buffer.reset()
                     steps_since_update = 0
                     agent.save(WEIGHTS_DIR)
+                    print(f"    [epoch {epoch} ep {sub_episode + 1}/"
+                          f"{N_EPISODES_PER_DAY}] {N_ITERATIONS} PPO iters  "
+                          f"loss={ppo_loss:.6f}  "
+                          f"actor={last_loss_components['actor_loss']:.4f}  "
+                          f"critic={last_loss_components['critic_loss']:.4f}  "
+                          f"H={last_loss_components['entropy']:.4f}")
+                    sub_episode += 1
 
             ramp_flow_accum = [0.0] * N_AGENTS
             queue_accum     = [0.0] * N_AGENTS
             main_flow_accum = [0.0] * N_AGENTS
             main_occ_accum  = [0.0] * N_AGENTS
             main_spd_accum  = [0.0] * N_AGENTS
+            tis_accum       = 0.0
             sim_steps_accum = 0
             prev_actions    = actions[:]
             ctrl_step      += 1
@@ -1317,13 +1570,15 @@ def run_episode(episode:      int,
     finally:
         traci.close()
 
-    # Flush any remaining experience in the buffer and persist final weights
-    if ep_type == 'mappo' and len(buffer) >= 1:
+    # End-of-day flush: drain any remaining experience and persist weights
+    if is_mappo_train and len(buffer) >= 1:
         last_val = agent.get_value(np.array(buffer.obs[-1], dtype=np.float32))
-        ppo_loss = ppo_update(agent, buffer, last_val)
+        for _it in range(N_ITERATIONS):
+            last_loss_components = ppo_update(agent, buffer, last_val)
+        ppo_loss = last_loss_components['loss']
         buffer.reset()
         agent.save(WEIGHTS_DIR)
-    elif ep_type == 'mappo':
+    elif is_mappo_train:
         agent.save(WEIGHTS_DIR)
 
     avg_reward = float(np.mean(rewards_hist)) if rewards_hist else 0.0
@@ -1332,21 +1587,37 @@ def run_episode(episode:      int,
         if speed_hist else 0.0
     )
     # KPIs (Objective 4)
-    ttt_hours    = ttt_seconds / 3600.0
-    avg_queue_m  = queue_sum_m / max(ctrl_step, 1)
+    ttt_hours          = ttt_seconds / 3600.0
+    avg_queue_m        = queue_sum_m / max(ctrl_step, 1)
+    total_throughput   = int(sum(passed_totals))   # vehicles served via ramps
+    mean_waiting_time  = waiting_sum / max(total_throughput, 1)
+    mean_tis           = tis_episode_sum / max(ctrl_step, 1) / max(CTRL_INTERVAL, 1)
 
     summary = {
-        'episode':         episode,
-        'ep_type':         ep_type,
-        'cum_reward':      cum_reward,
-        'avg_reward':      avg_reward,
-        'avg_speed_kmh':   avg_spd_kmh,
-        'total_passed_r1': passed_totals[0],
-        'total_passed_r2': passed_totals[1],
-        'n_steps':         ctrl_step,
-        'ppo_loss':        ppo_loss,
-        'ttt_hours':       ttt_hours,
-        'avg_queue_m':     avg_queue_m,
+        'epoch':            epoch,
+        'episode':          episode,
+        'ep_type':          ep_type,
+        'start_time':       float(sim_start),
+        'end_time':         float(traci.simulation.getTime()
+                                  if not eval_mode else END_TIME),
+        'cum_reward':       cum_reward,
+        'mean_reward':      avg_reward,
+        'avg_reward':       avg_reward,            # back-compat alias
+        'mean_tis':         mean_tis,
+        'mean_queue':       avg_queue_m,
+        'throughput':       total_throughput,
+        'mean_waiting_time': mean_waiting_time,
+        'mean_speed':       avg_spd_kmh,
+        'avg_speed_kmh':    avg_spd_kmh,           # back-compat alias
+        'total_passed_r1':  passed_totals[0],
+        'total_passed_r2':  passed_totals[1],
+        'n_steps':          ctrl_step,
+        'ppo_loss':         ppo_loss,
+        'actor_loss':       last_loss_components['actor_loss'],
+        'critic_loss':      last_loss_components['critic_loss'],
+        'entropy':          last_loss_components['entropy'],
+        'ttt_hours':        ttt_hours,
+        'avg_queue_m':      avg_queue_m,           # back-compat alias
         'safety_overrides': safety_overrides,
     }
 
@@ -1356,7 +1627,10 @@ def run_episode(episode:      int,
           f"avg_spd={avg_spd_kmh:.1f} km/h  steps={ctrl_step}"
           f"  ppo_loss={ppo_loss:.6f}")
     print(f"    KPI ▸ TTT={ttt_hours:.2f} veh·h   "
-          f"avg_queue={avg_queue_m:.1f} m   "
+          f"mean_TIS={mean_tis:.1f} veh   "
+          f"mean_queue={avg_queue_m:.1f} m   "
+          f"throughput={total_throughput}   "
+          f"mean_wait={mean_waiting_time:.2f}s   "
           f"safety_overrides={safety_overrides}")
     return summary
 
@@ -1462,24 +1736,30 @@ def main():
     print("=" * 70)
     print("  MASAR — Multi-Agent Synchronizer for Adaptive Ramps")
     print("  MAPPO + Parameter Sharing + GAT  |  King Fahad Highway")
-    print("  Objective: maximise mean highway speed, minimise queues + spill-back")
+    print("  Objective: minimise time-in-system + ramp queues (cooperative)")
     print("=" * 70)
-    print(f"  Agents        : {[c['name'] for c in AGENT_CFG]}")
+    print(f"  Agents        : {N_AGENTS} ({[c['name'] for c in AGENT_CFG]})")
     print(f"  OBS_DIM       : {OBS_DIM}  "
           f"[occ_dn, queue, released, prev_act, speed, occ_up]")
-    print(f"  Action space  : {ACTION_LABEL}  (yellow {YELLOW_DURATION}s on green→red)")
-    print(f"  Safety override: forced go when ramp queue ≥ {SPILLBACK_QUEUE_M:.0f} m")
-    print(f"  Free-flow spd : {FREE_FLOW_SPEED} m/s  "
-          f"({FREE_FLOW_SPEED*3.6:.0f} km/h)")
-    print(f"  GAT           : embed={GAT_EMBED}  out={GAT_OUT}  "
-          f"→ enriched={ENRICH_DIM}")
-    print(f"  Episodes      : {N_EPISODES}  "
-          f"({N_BASELINE_EPS} baseline + {N_TRAIN_EPS} MAPPO)")
-    print(f"  Episode length: {END_TIME}s  |  ctrl_interval={CTRL_INTERVAL}s")
-    print(f"  PPO  γ={GAMMA} λ={GAE_LAMBDA} ε={CLIP_EPS} lr={LR}  "
-          f"online_update_every={UPDATE_INTERVAL}")
-    print(f"  KPIs reported : Total Travel Time (h), Avg Queue Length (m)")
-    print(f"  Outputs → {LOG_DIR}/")
+    print(f"  Action space  : {ACTION_LABEL}")
+    print(f"                  (yellow {YELLOW_DURATION}s on any green→red)")
+    print(f"  Safety override: forced Free when ramp queue ≥ {SPILLBACK_QUEUE_M:.0f} m")
+    print(f"  GAT           : chain topology, {GAT_LAYERS} stacked layers, "
+          f"embed={GAT_EMBED} out={GAT_OUT} → enriched={ENRICH_DIM}")
+    print(f"  Baselines     : {len(BASELINE_TYPES)}  "
+          f"({', '.join(BASELINE_TYPES)})")
+    print(f"                  each runs ALONE for one full simulated day")
+    print(f"  MAPPO training: {N_EPOCHS} epoch(s) × "
+          f"{N_EPISODES_PER_DAY} episode(s)/day × {N_ITERATIONS} PPO iters/episode"
+          f"{'  [DEBUG_MODE]' if DEBUG_MODE else ''}")
+    print(f"  Day length    : {END_TIME}s  |  episode={EPISODE_LEN_S}s  "
+          f"|  ctrl_interval={CTRL_INTERVAL}s")
+    print(f"  PPO  γ={GAMMA} λ={GAE_LAMBDA} ε={CLIP_EPS} lr={LR}")
+    print(f"  Reward        : -tis_pen - {QUEUE_REWARD_WEIGHT}·queue_pen  "
+          f"(no speed/occupancy proxies)")
+    print(f"  KPIs reported : reward, mean_tis, mean_queue, throughput, "
+          f"mean_waiting_time, mean_speed")
+    print(f"  Outputs       : {LOG_DIR}/  +  {RESULTS_DIR}/")
     print()
 
     agent     = MAPPOAgent()
@@ -1500,33 +1780,73 @@ def main():
         'reward', 'cum_reward', 'value', 'passed_total',
     ]
     ep_csv_fields = [
-        'episode', 'ep_type', 'cum_reward', 'avg_reward', 'avg_speed_kmh',
-        'total_passed_r1', 'total_passed_r2', 'n_steps', 'ppo_loss',
+        'epoch', 'episode', 'ep_type',
+        'start_time', 'end_time',
+        'cum_reward', 'mean_reward', 'avg_reward',
+        'mean_tis', 'mean_queue', 'throughput',
+        'mean_waiting_time', 'mean_speed', 'avg_speed_kmh',
+        'total_passed_r1', 'total_passed_r2', 'n_steps',
+        'ppo_loss', 'actor_loss', 'critic_loss', 'entropy',
         'ttt_hours', 'avg_queue_m', 'safety_overrides',
     ]
 
-    with (open(CSV_PATH,    'w', newline='', encoding='utf-8') as sf,
-          open(EP_CSV_PATH, 'w', newline='', encoding='utf-8') as ef):
+    def _open_method_csv(stack, method: str):
+        """Open results/{method}_day.csv, register on the exit stack, return writer."""
+        path = RESULTS_DIR / f'{method}_day.csv'
+        fh   = stack.enter_context(open(path, 'w', newline='', encoding='utf-8'))
+        w    = csv.DictWriter(fh, fieldnames=step_csv_fields)
+        w.writeheader()
+        return w, path
+
+    import contextlib
+    with contextlib.ExitStack() as stack:
+        sf = stack.enter_context(open(CSV_PATH,    'w', newline='', encoding='utf-8'))
+        ef = stack.enter_context(open(EP_CSV_PATH, 'w', newline='', encoding='utf-8'))
 
         step_writer = csv.DictWriter(sf, fieldnames=step_csv_fields)
-        ep_writer   = csv.DictWriter(ef, fieldnames=ep_csv_fields)
+        ep_writer   = csv.DictWriter(ef, fieldnames=ep_csv_fields,
+                                     extrasaction='ignore')
         step_writer.writeheader()
         ep_writer.writeheader()
 
-        for ep in range(1, N_EPISODES + 1):
-            ep_type = (BASELINE_TYPES[ep - 1]
-                       if ep <= N_BASELINE_EPS else 'mappo')
+        ep_id = 0
 
-            summary = run_episode(ep, ep_type, agent, buffer,
-                                  step_writer, ep_writer)
+        # 1) Baselines — each policy runs ALONE across one full day.
+        #    Per-method CSV: results/{method}_day.csv
+        for btype in BASELINE_TYPES:
+            ep_id += 1
+            method_writer, method_path = _open_method_csv(stack, btype)
+            summary = run_episode(ep_id, btype, agent, buffer,
+                                  step_writer, ep_writer, epoch=0,
+                                  method_csv_writer=method_writer)
             summaries.append(summary)
-            sf.flush()
-            ef.flush()
+            sf.flush(); ef.flush()
+            print(f"  [results] {btype} → {method_path}")
 
-            if ep_type == 'mappo' and ep % CKPT_EVERY == 0:
-                ckpt_dir = WEIGHTS_DIR / f'ep{ep:03d}'
+        # 2) MAPPO training — nested epoch × episode × iteration loop.
+        for epoch in range(1, N_EPOCHS + 1):
+            ep_id += 1
+            summary = run_episode(ep_id, 'mappo', agent, buffer,
+                                  step_writer, ep_writer, epoch=epoch)
+            summaries.append(summary)
+            sf.flush(); ef.flush()
+
+            if epoch % CKPT_EVERY_EPOCH == 0:
+                ckpt_dir = WEIGHTS_DIR / f'epoch{epoch:03d}'
                 agent.save(ckpt_dir)
                 print(f"  [checkpoint] saved → {ckpt_dir}")
+
+        # 3) Final MAPPO evaluation — greedy, no learning, full day.
+        ep_id += 1
+        eval_writer, eval_path = _open_method_csv(stack, 'mappo_eval')
+        eval_summary = run_episode(ep_id, 'mappo', agent, buffer,
+                                   step_writer, ep_writer, epoch=0,
+                                   eval_mode=True,
+                                   method_csv_writer=eval_writer)
+        eval_summary['ep_type'] = 'mappo_eval'
+        summaries.append(eval_summary)
+        sf.flush(); ef.flush()
+        print(f"  [results] final MAPPO eval → {eval_path}")
 
     agent.save(WEIGHTS_DIR)
     print(f"\n  [weights] final save → {WEIGHTS_DIR}/")
@@ -1538,6 +1858,7 @@ def main():
     print(f"\n  Done.")
     print(f"  Step log        → {CSV_PATH}")
     print(f"  Episode summary → {EP_CSV_PATH}")
+    print(f"  Per-method CSVs → {RESULTS_DIR}/")
     print(f"  Weights         → {WEIGHTS_DIR}/")
     print(f"  Images          → {IMG_DIR}/")
     print(f"  Comparison plot → {LOG_DIR / 'comparison_summary.png'}")

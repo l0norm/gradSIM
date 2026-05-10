@@ -245,6 +245,7 @@ def simulate(weights_dir: Path, end_time: float, use_gui: bool,
     queue_accum     = [0.0] * N_AGENTS
     main_occ_accum  = [0.0] * N_AGENTS
     main_spd_accum  = [0.0] * N_AGENTS
+    tis_accum       = 0.0
     sim_steps_accum = 0
     cum_reward      = 0.0
     ctrl_step       = 0
@@ -278,9 +279,11 @@ def simulate(weights_dir: Path, end_time: float, use_gui: bool,
                 # Advance yellow countdowns
                 process_yellow_transitions(runtime_cfg, signal_chars, yellow_timers)
 
-                # KPI: Total Travel Time = Σ vehicles × dt
+                # KPI + reward signal: Total Travel Time = Σ vehicles × dt
                 try:
-                    ttt_seconds += traci.vehicle.getIDCount() * STEP_LEN
+                    vehs_now      = traci.vehicle.getIDCount()
+                    ttt_seconds  += vehs_now * STEP_LEN
+                    tis_accum    += float(vehs_now)
                 except traci.exceptions.TraCIException:
                     pass
 
@@ -322,7 +325,7 @@ def simulate(weights_dir: Path, end_time: float, use_gui: bool,
                 avg_occ   = [main_occ_accum[i] / CTRL_INTERVAL for i in range(N_AGENTS)]
                 avg_queue = [queue_accum[i]    / CTRL_INTERVAL for i in range(N_AGENTS)]
                 queue_sum_m += float(np.mean(avg_queue))
-                reward  = compute_reward(main_spd_accum, main_occ_accum, queue_accum)
+                reward  = compute_reward(tis_accum, queue_accum)
                 cum_reward += reward
 
                 # Console display
@@ -347,6 +350,7 @@ def simulate(weights_dir: Path, end_time: float, use_gui: bool,
                 queue_accum     = [0.0] * N_AGENTS
                 main_occ_accum  = [0.0] * N_AGENTS
                 main_spd_accum  = [0.0] * N_AGENTS
+                tis_accum       = 0.0
                 sim_steps_accum = 0
                 prev_actions    = actions[:]
                 ctrl_step      += 1

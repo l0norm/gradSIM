@@ -224,8 +224,8 @@ def save_step_image(ctrl_step:    int,
                 [ah[ai] for ah in actions_hist],
                 color=_COLORS[ai], label=AGENT_CFG[ai]['name'],
                 linewidth=1.0, where='post')
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(['Stop', 'Go'], fontsize=7)
+    ax.set_yticks(list(range(ACTION_DIM)))
+    ax.set_yticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)], fontsize=7)
     ax.set_title('Action per Agent'); ax.set_xlabel('Ctrl step')
     ax.legend(fontsize=7, ncol=2); ax.grid(True, alpha=0.3)
 
@@ -271,7 +271,7 @@ def save_step_image(ctrl_step:    int,
         ax.bar(x + (ai - (N_AGENTS - 1) / 2.0) * w, counts, w,
                label=AGENT_CFG[ai]['name'], color=_COLORS[ai], alpha=0.8)
     ax.set_xticks(x)
-    ax.set_xticklabels(['Stop\nred', 'Go\ngreen'], fontsize=7)
+    ax.set_xticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)], fontsize=7)
     ax.set_title('Action Distribution (so far)')
     ax.legend(fontsize=7, ncol=2); ax.grid(True, axis='y', alpha=0.3)
 
@@ -281,7 +281,7 @@ def save_step_image(ctrl_step:    int,
         last_p = probs_hist[-1]   # [N, A]
         im = ax.imshow(last_p, aspect='auto', cmap='YlGn', vmin=0, vmax=1)
         ax.set_xticks(range(ACTION_DIM))
-        ax.set_xticklabels(['Stop', 'Go'], fontsize=7)
+        ax.set_xticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)], fontsize=7)
         ax.set_yticks(range(N_AGENTS))
         ax.set_yticklabels([c['name'] for c in AGENT_CFG], fontsize=7)
         ax.set_title('Policy Probs (this step)')
@@ -372,8 +372,8 @@ def save_summary_plot(rewards_hist:  List[float],
         axes[0, 2].step(steps, [ah[ai] for ah in actions_hist],
                         color=_COLORS[ai], label=AGENT_CFG[ai]['name'],
                         linewidth=1.0, where='post')
-    axes[0, 2].set_yticks([0, 1])
-    axes[0, 2].set_yticklabels(['Stop', 'Go'])
+    axes[0, 2].set_yticks(list(range(ACTION_DIM)))
+    axes[0, 2].set_yticklabels([ACTION_LABEL[a] for a in range(ACTION_DIM)])
     axes[0, 2].set_title('Actions over Time'); axes[0, 2].set_xlabel('Control step')
     axes[0, 2].legend(fontsize=8, ncol=2); axes[0, 2].grid(True, alpha=0.3)
 
@@ -688,6 +688,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
     main_flow_accum = [0.0] * N_AGENTS
     main_occ_accum  = [0.0] * N_AGENTS
     main_spd_accum  = [0.0] * N_AGENTS
+    tis_accum       = 0.0
     sim_steps_accum = 0
 
     # Traffic-light state tracking for yellow transition
@@ -732,9 +733,11 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                 # Advance yellow countdowns each sim step
                 process_yellow_transitions(runtime_cfg, signal_chars, yellow_timers)
 
-                # KPI: Total Travel Time accumulator (vehicle-seconds)
+                # KPI + reward signal: Total Travel Time = Σ vehicles × dt
                 try:
-                    ttt_seconds += traci.vehicle.getIDCount() * STEP_LEN
+                    vehs_now      = traci.vehicle.getIDCount()
+                    ttt_seconds  += vehs_now * STEP_LEN
+                    tis_accum    += float(vehs_now)
                 except traci.exceptions.TraCIException:
                     pass
 
@@ -770,7 +773,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                         print(f"  [TL warning] {cfg['name']} a={actions[i]}: {exc}")
                     passed_totals[i] += int(ramp_flow_accum[i])
 
-                reward     = compute_reward(main_spd_accum, main_occ_accum, queue_accum)
+                reward     = compute_reward(tis_accum, queue_accum)
                 cum_reward += reward
 
                 avg_spd   = [main_spd_accum[i] / CTRL_INTERVAL for i in range(N_AGENTS)]
@@ -828,6 +831,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                 main_flow_accum = [0.0] * N_AGENTS
                 main_occ_accum  = [0.0] * N_AGENTS
                 main_spd_accum  = [0.0] * N_AGENTS
+                tis_accum       = 0.0
                 sim_steps_accum = 0
                 prev_actions    = actions[:]
                 ctrl_step      += 1

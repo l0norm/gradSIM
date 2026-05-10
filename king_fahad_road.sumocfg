@@ -1,7 +1,7 @@
 <configuration>
 
     <input>
-        <net-file value="king_fahad.net.xml.gz"/>
+        <net-file value="king_fahad_5ramp.net.xml.gz"/>
         <route-files value="routes.rou.xml"/>
         <additional-files value="detectors.add.xml,ramp_tl.add.xml"/>
     </input>

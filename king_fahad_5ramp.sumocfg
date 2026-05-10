@@ -1,8 +1,8 @@
 <configuration>
 
     <input>
-        <net-file value="init5_king_fahad.net.xml.gz"/>
-        <route-files value="init5_routes.rou.xml"/>
+        <net-file value="king_fahad.net.xml.gz"/>
+        <route-files value="routes.rou.xml"/>
         <additional-files value="detectors.add.xml"/>
     </input>
 
