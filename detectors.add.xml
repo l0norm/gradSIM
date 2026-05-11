@@ -1,43 +1,43 @@
 <additional>
     <!-- ALINEA-matched detector family for the 5 ingress ramps.
-         E1 = release loop after the meter
+         E1 = release loop after the meter (near lane end, counts vehicles passing the signal)
          E2 = ramp queue detector
          E3 = downstream mainline occupancy/flow detectors -->
 
-    <!-- ramp 1 : 413583321 -> 413583321.109 -> 779862593#1-AddedOnRampEdge -->
-    <inductionLoop id="alinea_413583321_E1" lane="413583321.109_0" pos="3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
+    <!-- ramp 1 : 413583321 -> 779862593#1-AddedOnRampEdge -->
+    <inductionLoop id="alinea_413583321_E1" lane="413583321_0" pos="-3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413583321_E2" lane="413583321_0" pos="0" length="97.64" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413583321_E3_0" lane="779862593#1-AddedOnRampEdge_0" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413583321_E3_1" lane="779862593#1-AddedOnRampEdge_1" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413583321_E3_2" lane="779862593#1-AddedOnRampEdge_2" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413583321_E3_3" lane="779862593#1-AddedOnRampEdge_3" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
 
-    <!-- ramp 2 : 413587595 -> 413587595.110 -> 779862593#3-AddedOnRampEdge -->
-    <inductionLoop id="alinea_413587595_E1" lane="413587595.110_0" pos="3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
+    <!-- ramp 2 : 413587595 -> 779862593#3-AddedOnRampEdge -->
+    <inductionLoop id="alinea_413587595_E1" lane="413587595_0" pos="-3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413587595_E2" lane="413587595_0" pos="0" length="66.96" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413587595_E3_0" lane="779862593#3-AddedOnRampEdge_0" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413587595_E3_1" lane="779862593#3-AddedOnRampEdge_1" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413587595_E3_2" lane="779862593#3-AddedOnRampEdge_2" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_413587595_E3_3" lane="779862593#3-AddedOnRampEdge_3" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
 
-    <!-- ramp 3 : 1301290506 -> 1301290506.80 -> 266901971#0-AddedOnRampEdge -->
-    <inductionLoop id="alinea_1301290506_E1" lane="1301290506.80_0" pos="3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
+    <!-- ramp 3 : 1301290506 -> 266901971#0-AddedOnRampEdge -->
+    <inductionLoop id="alinea_1301290506_E1" lane="1301290506_0" pos="-3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1301290506_E2" lane="1301290506_0" pos="0" length="39.13" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1301290506_E3_0" lane="266901971#0-AddedOnRampEdge_0" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1301290506_E3_1" lane="266901971#0-AddedOnRampEdge_1" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1301290506_E3_2" lane="266901971#0-AddedOnRampEdge_2" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1301290506_E3_3" lane="266901971#0-AddedOnRampEdge_3" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
 
-    <!-- ramp 4 : 92072668 -> 92072668.113 -> 266901971#2-AddedOnRampEdge -->
-    <inductionLoop id="alinea_92072668_E1" lane="92072668.113_0" pos="3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
+    <!-- ramp 4 : 92072668 -> 266901971#2-AddedOnRampEdge -->
+    <inductionLoop id="alinea_92072668_E1" lane="92072668_0" pos="-3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_92072668_E2" lane="92072668_0" pos="0" length="78.92" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_92072668_E3_0" lane="266901971#2-AddedOnRampEdge_0" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_92072668_E3_1" lane="266901971#2-AddedOnRampEdge_1" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_92072668_E3_2" lane="266901971#2-AddedOnRampEdge_2" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_92072668_E3_3" lane="266901971#2-AddedOnRampEdge_3" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
 
-    <!-- ramp 5 : 1300204703 -> 1300204703.112 -> 40924152#3-AddedOnRampEdge -->
-    <inductionLoop id="alinea_1300204703_E1" lane="1300204703.112_0" pos="3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
+    <!-- ramp 5 : 1300204703 -> 40924152#3-AddedOnRampEdge -->
+    <inductionLoop id="alinea_1300204703_E1" lane="1300204703_0" pos="-3" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1300204703_E2" lane="1300204703_0" pos="0" length="112.87" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1300204703_E3_0" lane="40924152#3-AddedOnRampEdge_0" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
     <laneAreaDetector id="alinea_1300204703_E3_1" lane="40924152#3-AddedOnRampEdge_1" pos="30" length="30" period="900" file="detectors_sb_output.xml" friendlyPos="true"/>
