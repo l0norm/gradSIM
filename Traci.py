@@ -10,11 +10,13 @@ Architecture
 ------------
   Agents      : 5 ramp meters  (ramp_1 ... ramp_5)
   Metering    : Real ramp-meter traffic lights with green→yellow→red transitions
-  Actions     : 2 discrete  0=stop(red)  1=go(green)
+  Actions     : 3 discrete  0=Block(red)  1=Slow(18 km/h)  2=Free(100 km/h)
                 Yellow is an automatic 3-second intermediate when green→red.
-                A safety override forces green when ramp queue risks spill-back.
-  Observation : 6-dim per agent — local + neighbouring traffic info, per the
-                MASAR design spec (queue, occ upstream/downstream, mean speed):
+                A safety override forces Free when ramp queue risks spill-back.
+  Observation : 6-dim per agent — 4 core MASAR state variables (queue, occ
+                downstream, occ upstream, mean speed) plus 2 enhancements
+                (released vehicles for throughput context, previous action for
+                recurrent memory).  Full breakdown:
                   obs[0] = downstream main-lane occupancy (E3, normalised)
                   obs[1] = ramp queue length (E2, normalised)
                   obs[2] = released ramp vehicles (E1, normalised)
@@ -70,7 +72,7 @@ else:
 import traci  # noqa: E402
 
 # ── Simulation / control ──────────────────────────────────────────────────────
-SUMO_CFG      = 'king_fahad_5ramp.sumocfg'
+SUMO_CFG      = 'king_fahad_road.sumocfg'
 STEP_LEN      = 1.0    # simulation step length (seconds)
 CTRL_INTERVAL = 5      # control decision every N sim-seconds
 
@@ -228,7 +230,8 @@ MAX_TIS_VEHICLES = 1500.0
 # replaced with a forced 'go' to drain the queue and prevent spill-back onto
 # upstream surface streets — addresses the safety-mechanism gap noted in the
 # literature review of Deng et al.'s MAPPO ramp-metering work.
-SPILLBACK_QUEUE_M = 100.0
+SPILLBACK_QUEUE_M     = 100.0
+UNSAFE_ACTION_PENALTY = 0.1   # Yang et al. ARM reward-penalty weight for overridden unsafe actions
 
 # ── Neural-network hyper-parameters ──────────────────────────────────────────
 GAT_EMBED  = 16
@@ -1014,31 +1017,38 @@ def get_runtime_agent_cfg(verbose: bool = True) -> List[Dict]:
 QUEUE_REWARD_WEIGHT = 0.5  # β: relative weight of ramp-queue penalty vs TIS
 
 def compute_reward(tis_accum:    float,
-                   queue_accum:  List[float]) -> float:
+                   queue_accum:  List[float],
+                   n_unsafe:     int = 0) -> float:
     """
-    MASAR cooperative reward — minimises Time In System (TIS) and ramp queues.
+    MASAR cooperative reward — minimises Time In System (TIS) and ramp queues,
+    with an additional penalty for unsafe actions (Yang et al. ARM).
 
-    The two terms have minimal inductive bias:
+    The three terms have minimal inductive bias:
       • TIS = total vehicle-seconds spent in the network during the interval.
         Reducing TIS is equivalent to maximising mainline throughput (since
         Little's law links them via arrivals), so this single signal subsumes
         the previous speed/occupancy proxies without baking in a TARGET_OCC.
       • Ramp queue length — penalises spill-back / unfairness at the ramps.
+      • Unsafe actions — penalises steps where the ARM forced an override,
+        discouraging repeated unsafe behaviour (Yang et al. reward-penalty ARM).
 
-    Both terms are normalised so the per-step reward stays roughly in
-    [-(1 + β), 0].  Higher (less negative) = better.
+    All terms are normalised so the per-step reward stays roughly in
+    [-(1 + β + γ), 0].  Higher (less negative) = better.
 
-        tis_pen   = mean_vehicles_in_network / MAX_TIS_VEHICLES
-        queue_pen = mean(ramp_queue_m) / MAX_QUEUE_M
-        r         = -tis_pen  -  β · queue_pen
+        tis_pen    = mean_vehicles_in_network / MAX_TIS_VEHICLES
+        queue_pen  = mean(ramp_queue_m) / MAX_QUEUE_M
+        unsafe_pen = n_unsafe / N_AGENTS
+        r          = -tis_pen - β·queue_pen - γ·unsafe_pen
     """
     mean_vehicles = float(tis_accum) / max(CTRL_INTERVAL, 1)
     avg_queue     = float(np.mean(queue_accum)) / max(CTRL_INTERVAL, 1)
 
-    tis_pen   = mean_vehicles / MAX_TIS_VEHICLES
-    queue_pen = avg_queue     / MAX_QUEUE_M
+    tis_pen    = mean_vehicles / MAX_TIS_VEHICLES
+    queue_pen  = avg_queue     / MAX_QUEUE_M
+    unsafe_pen = n_unsafe / max(N_AGENTS, 1)
 
-    return float(-tis_pen - QUEUE_REWARD_WEIGHT * queue_pen)
+    return float(-tis_pen - QUEUE_REWARD_WEIGHT * queue_pen
+                 - UNSAFE_ACTION_PENALTY * unsafe_pen)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1456,7 +1466,8 @@ def run_episode(episode:      int,
             # ARM safety override — force green if a ramp's queue threatens spill-back
             raw_actions = actions[:]
             actions     = apply_safety_override(actions, queue_accum)
-            safety_overrides += sum(1 for a, b in zip(raw_actions, actions) if a != b)
+            n_unsafe    = sum(1 for a, b in zip(raw_actions, actions) if a != b)
+            safety_overrides += n_unsafe
 
             # Apply signals with yellow transition when going green → red
             for i, cfg in enumerate(runtime_cfg):
@@ -1467,7 +1478,7 @@ def run_episode(episode:      int,
                     print(f"  [TL warning] {cfg['name']} action={actions[i]}: {exc}")
                 passed_totals[i] += int(ramp_flow_accum[i])
 
-            reward     = compute_reward(tis_accum, queue_accum)
+            reward     = compute_reward(tis_accum, queue_accum, n_unsafe)
             cum_reward += reward
             done       = (sim_time >= END_TIME - CTRL_INTERVAL)
             tis_episode_sum += tis_accum  # accumulate window-mean for KPI

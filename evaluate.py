@@ -145,6 +145,7 @@ EVAL_CSV_FIELDS = [
     'speed_ms',
     'implied_rate_vph',
     'ramp_flow',
+    'ramp_queue_m',
     'main_flow',
     'main_speed_ms',
     'occ_mean_pct',
@@ -152,8 +153,9 @@ EVAL_CSV_FIELDS = [
     'cum_reward',
     'value',
     'passed_total',
-    'prob_stop',
-    'prob_go',
+    'prob_block',
+    'prob_slow',
+    'prob_free',
 ]
 
 
@@ -419,7 +421,8 @@ def save_summary_plot(rewards_hist:  List[float],
                             b.get_height() + 0.5,
                             f'{p:.0f}%', ha='center', va='bottom', fontsize=6)
     axes[1, 2].set_xticks(x)
-    axes[1, 2].set_xticklabels(['Stop\nred', 'Go\ngreen'])
+    axes[1, 2].set_xticklabels([ACTION_LABEL[a].replace('(', '\n(') for a in range(ACTION_DIM)],
+                               fontsize=7)
     axes[1, 2].set_title('Action Distribution'); axes[1, 2].legend(fontsize=7, ncol=2)
     axes[1, 2].grid(True, axis='y', alpha=0.3)
 
@@ -545,6 +548,28 @@ def save_comparison_plot(eval_csv: Path, alinea_csv: Path):
             ax.set_xlabel('Sim time (s)'); ax.set_ylabel('Speed (km/h)')
             ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
+    # Row 4+: Ramp queue (if available in both CSVs)
+    q_col_al = next((c for c in ['ramp_queue_m', 'queue_m', 'queue_len_m', 'queue_max_m'] if c in al.columns), None)
+    q_col_mp = next((c for c in ['ramp_queue_m', 'queue_m', 'queue_len_m', 'queue_max_m'] if c in mp.columns), None)
+    if q_col_al or q_col_mp:
+        queue_row = n_rows
+        fig.set_size_inches(fig.get_size_inches()[0], 4 * (n_rows + 1))
+        gs = gridspec.GridSpec(n_rows + 1, len(RAMP_MAP), figure=fig,
+                               hspace=0.60, wspace=0.30)
+        for col, (ali_ramp, mappo_ramp) in enumerate(RAMP_MAP.items()):
+            ax = fig.add_subplot(gs[queue_row, col])
+            a  = al[al['ramp'] == ali_ramp]
+            m  = mp[mp['ramp'] == mappo_ramp]
+            if q_col_al and not a.empty:
+                ax.plot(a['sim_time'].values, a[q_col_al].values,
+                        color=ALINEA_COLOR, linewidth=1.1, alpha=0.85, label='ALINEA')
+            if q_col_mp and not m.empty:
+                ax.plot(m['sim_time'].values, m[q_col_mp].values,
+                        color=MAPPO_COLOR, linewidth=1.1, alpha=0.85, label='MAPPO+GAT')
+            ax.set_title('Ramp Queue Length (m)')
+            ax.set_xlabel('Sim time (s)'); ax.set_ylabel('Queue (m)')
+            ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
     # Summary stats box
     try:
         stat_lines = ['SUMMARY STATISTICS\n']
@@ -588,7 +613,8 @@ def save_comparison_plot(eval_csv: Path, alinea_csv: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
-             stochastic: bool, save_images: bool, best: bool):
+             stochastic: bool, save_images: bool, best: bool,
+             alinea_csv: Path = None):
 
     weights_dir = Path(weights_dir)
     if best:
@@ -612,13 +638,12 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
     obs_dim = infer_obs_dim_from_checkpoint(weights_dir)
     if obs_dim != OBS_DIM:
         print("=" * 60)
-        print("ERROR: Checkpoint is not compatible with the current ALINEA-matched MAPPO setup.")
+        print("ERROR: Checkpoint obs_dim does not match current model config.")
         print(f"  Checkpoint obs dim : {obs_dim}")
         print(f"  Required obs dim   : {OBS_DIM}")
         print()
-        print("  This evaluation now uses the same 5-ramp E1/E2/E3 stop/go setup as ALINEA.")
-        print("  Retrain MAPPO on this setup first:")
-        print("    ./venv/bin/python Traci.py")
+        print("  Retrain the MAPPO policy first:")
+        print("    python Traci.py")
         print("=" * 60)
         sys.exit(1)
     agent = MAPPOAgent(obs_dim=obs_dim)
@@ -626,11 +651,10 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
         agent.load(weights_dir)
     except RuntimeError as exc:
         print("=" * 60)
-        print(f"ERROR: {exc}")
+        print(f"ERROR loading checkpoint: {exc}")
         print()
-        print("  Evaluation now expects the retrained 2-action stop/go policy.")
         print("  Train a fresh checkpoint with:")
-        print("    ./venv/bin/python Traci.py")
+        print("    python Traci.py")
         print("=" * 60)
         sys.exit(1)
     tag = 'Stochastic' if stochastic else 'Greedy'
@@ -763,7 +787,8 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                 # ARM safety override
                 raw_actions = actions[:]
                 actions     = apply_safety_override(actions, queue_accum)
-                safety_overrides += sum(1 for a, b in zip(raw_actions, actions) if a != b)
+                n_unsafe    = sum(1 for a, b in zip(raw_actions, actions) if a != b)
+                safety_overrides += n_unsafe
 
                 for i, cfg in enumerate(runtime_cfg):
                     try:
@@ -773,7 +798,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                         print(f"  [TL warning] {cfg['name']} a={actions[i]}: {exc}")
                     passed_totals[i] += int(ramp_flow_accum[i])
 
-                reward     = compute_reward(tis_accum, queue_accum)
+                reward     = compute_reward(tis_accum, queue_accum, n_unsafe)
                 cum_reward += reward
 
                 avg_spd   = [main_spd_accum[i] / CTRL_INTERVAL for i in range(N_AGENTS)]
@@ -800,6 +825,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                 )
 
                 for i, cfg in enumerate(runtime_cfg):
+                    p = probs[i] if probs.ndim == 2 else probs
                     writer.writerow({
                         'episode':          -1,
                         'ep_type':          'eval',
@@ -809,6 +835,7 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                         'speed_ms':         SPEED_TABLE[actions[i]],
                         'implied_rate_vph': RATE_VPH_TABLE[actions[i]],
                         'ramp_flow':        f'{ramp_flow_accum[i]:.1f}',
+                        'ramp_queue_m':     f'{avg_queue[i]:.2f}',
                         'main_flow':        f'{main_flow_accum[i]:.1f}',
                         'main_speed_ms':    f'{avg_spd[i]:.4f}',
                         'occ_mean_pct':     f'{avg_occ[i]:.4f}',
@@ -816,8 +843,9 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                         'cum_reward':       f'{cum_reward:.4f}',
                         'value':            f'{value:.4f}',
                         'passed_total':     passed_totals[i],
-                        'prob_stop':        f'{probs[i, 0]:.4f}',
-                        'prob_go':          f'{probs[i, 1]:.4f}',
+                        'prob_block':       f'{p[0]:.4f}',
+                        'prob_slow':        f'{p[1]:.4f}' if len(p) > 1 else '0.0000',
+                        'prob_free':        f'{p[2]:.4f}' if len(p) > 2 else '0.0000',
                     })
 
                 if save_images:
@@ -880,10 +908,12 @@ def evaluate(weights_dir: Path, end_time: float, use_gui: bool,
                       flows_hist, speed_hist, occ_hist, rate_hist,
                       passed_totals, stochastic)
 
-    if ALINEA_CSV.exists():
-        save_comparison_plot(EVAL_CSV, ALINEA_CSV)
+    compare_with = Path(alinea_csv) if alinea_csv else ALINEA_CSV
+    if compare_with.exists():
+        save_comparison_plot(EVAL_CSV, compare_with)
     else:
-        print(f"  [comparison] ALINEA CSV not found at {ALINEA_CSV} — skipping")
+        print(f"  [comparison] Baseline CSV not found at {compare_with}")
+        print(f"               Pass --alinea-csv <path> to specify the ALINEA log.")
 
     print(f"\n  CSV log      → {EVAL_CSV}")
     print(f"  Step images  → {EVAL_IMGS}/")
@@ -911,6 +941,9 @@ def parse_args() -> argparse.Namespace:
                    help='Sample from policy distribution instead of argmax')
     p.add_argument('--images',     action='store_true',
                    help='Save a dashboard image at every control step (slow)')
+    p.add_argument('--alinea-csv', default=None, metavar='PATH',
+                   help='Path to the ALINEA/baseline TraCI CSV log for comparison '
+                        '(default: init simulation/alinea_log.csv if it exists)')
     p.set_defaults(gui=True)
     return p.parse_args()
 
@@ -924,4 +957,5 @@ if __name__ == '__main__':
         stochastic  = args.stochastic,
         save_images = args.images,
         best        = args.best,
+        alinea_csv  = args.alinea_csv,
     )
